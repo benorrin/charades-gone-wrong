@@ -38,36 +38,6 @@ func NewServer(database *db.Database) *Server {
 	}
 }
 
-// Request/Response types
-type CreateGameRequest struct {
-	GameType   string `json:"game_type"`
-	RoundCount int    `json:"round_count"`
-}
-
-type CreateGameResponse struct {
-	GameID string `json:"game_id"`
-	Code   string `json:"code"`
-	HostID string `json:"host_id"`
-}
-
-type JoinGameRequest struct {
-	Code string `json:"code"`
-}
-
-type JoinGameResponse struct {
-	GameID   string `json:"game_id"`
-	PlayerID string `json:"player_id"`
-	Players  int    `json:"player_count"`
-}
-
-type SetPlayerNameRequest struct {
-	Name string `json:"name"`
-}
-
-type StartGameRequest struct {
-	GameID string `json:"game_id"`
-}
-
 // HandleCreateGame endpoint
 func (s *Server) HandleCreateGame(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

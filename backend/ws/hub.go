@@ -3,56 +3,10 @@ package ws
 import (
 	"encoding/json"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
-
-// Message types for WebSocket communication
-type MessageType string
-
-const (
-	MsgTypePlayerJoined     MessageType = "player_joined"
-	MsgTypeGameStarted      MessageType = "game_started"
-	MsgTypeRoundStarted     MessageType = "round_started"
-	MsgTypeRoundEnded       MessageType = "round_ended"
-	MsgTypeScoresUpdated    MessageType = "scores_updated"
-	MsgTypeLeaderboard      MessageType = "leaderboard"
-	MsgTypeGameEnded        MessageType = "game_ended"
-	MsgTypePlayerList       MessageType = "player_list"
-	MsgTypePlayerSubmission MessageType = "player_submission"
-	MsgTypeSubmissionAck    MessageType = "submission_ack"
-	MsgTypeError            MessageType = "error"
-)
-
-// Message is the base message type sent over WebSocket
-type Message struct {
-	Type    MessageType `json:"type"`
-	GameID  string      `json:"game_id"`
-	Payload interface{} `json:"payload"`
-}
-
-// Client represents a WebSocket client connection
-type Client struct {
-	GameID   string
-	PlayerID string
-	Conn     *websocket.Conn
-	Send     chan *Message
-}
-
-// Hub manages all WebSocket connections for a game
-type Hub struct {
-	GameID       string
-	Clients      map[*Client]bool
-	Broadcast    chan *Message
-	Register     chan *Client
-	Unregister   chan *Client
-	Submissions  map[int]map[string]*PlayerSubmissionPayload
-	RoundAnswers map[int]int
-	mutex        sync.RWMutex
-	done         chan struct{}
-}
 
 // NewHub creates a new WebSocket hub for a game
 func NewHub(gameID string) *Hub {
@@ -255,7 +209,6 @@ func (c *Client) ReadPump(hub *Hub) {
 				hub.Submissions[submission.RoundNum] = make(map[string]*PlayerSubmissionPayload)
 			}
 			hub.Submissions[submission.RoundNum][c.PlayerID] = &submission
-			submissionCount := len(hub.Submissions[submission.RoundNum])
 
 			// Check if answer is correct (for pub_quiz rounds)
 			isCorrect := false
@@ -267,7 +220,7 @@ func (c *Client) ReadPump(hub *Hub) {
 			}
 			hub.mutex.Unlock()
 
-			log.Printf("[ReadPump] Player %s submitted answer for round %d at %d ms (%d/%d submissions received)", c.PlayerID, submission.RoundNum, submission.SubmissionTime, submissionCount, "unknown")
+			log.Printf("[ReadPump] Player %s submitted answer for round %d at %d ms", c.PlayerID, submission.RoundNum, submission.SubmissionTime)
 
 			// Send submission acknowledgement to this player
 			ackMsg := &Message{
