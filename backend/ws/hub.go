@@ -48,8 +48,8 @@ type Hub struct {
 	Broadcast    chan *Message
 	Register     chan *Client
 	Unregister   chan *Client
-	Submissions  map[int]map[string]*PlayerSubmissionPayload // round_num -> player_id -> submission
-	RoundAnswers map[int]int                                 // round_num -> correct_answer_idx
+	Submissions  map[int]map[string]*PlayerSubmissionPayload
+	RoundAnswers map[int]int
 	mutex        sync.RWMutex
 	done         chan struct{}
 }

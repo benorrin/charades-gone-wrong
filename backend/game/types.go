@@ -73,5 +73,5 @@ type Game struct {
 	Players       map[string]*Player
 	Rounds        []*Round
 	CreatedAt     time.Time
-	LastRoundType RoundType // Track last round type to avoid consecutive repeats
+	LastRoundType RoundType
 }

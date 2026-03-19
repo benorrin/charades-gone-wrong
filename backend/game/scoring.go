@@ -87,9 +87,9 @@ func AlibiScore(believableVotes int) int {
 // isMatching indicates if player's answer matched others
 func CopycatScore(isMatching bool) int {
 	if isMatching {
-		return 0 // Drinking/penalty
+		return 0
 	}
-	return 5 // Unique answer points
+	return 5
 }
 
 // RoundDurations returns the duration for each round type
