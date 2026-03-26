@@ -1,6 +1,15 @@
 package game
 
-import "time"
+import (
+	"game/db"
+	"game/ws"
+	"time"
+)
+
+// ValidatePubQuizAnswer checks if a player's answer is correct
+func ValidatePubQuizAnswer(answerIdx int, correctAnswerIdx int) bool {
+	return answerIdx == correctAnswerIdx
+}
 
 // PubQuizScoreWithTimestamp calculates points for pub quiz based on:
 // - Whether the answer was correct
@@ -109,4 +118,30 @@ func RoundDuration(rt RoundType) time.Duration {
 		return d
 	}
 	return 10 * time.Second // default
+}
+
+// ScorePubQuizRound scores all submissions for a pub quiz round and updates player scores
+// This is the single source of truth for pub quiz scoring logic
+func ScorePubQuizRound(game *Game, round *Round, submissions map[string]*ws.PlayerSubmissionPayload, question *db.PubQuizQuestion) {
+	if question == nil || game == nil {
+		return
+	}
+
+	for playerID, submission := range submissions {
+		if player, exists := game.Players[playerID]; exists {
+			// Validate answer correctness
+			isCorrect := ValidatePubQuizAnswer(submission.AnswerIdx, question.CorrectAnswerID)
+
+			// Calculate points using time-based multiplier
+			points := PubQuizScoreWithTimestamp(
+				isCorrect,
+				round.StartTime,
+				submission.SubmissionTime,
+				round.Duration,
+			)
+
+			// Apply points to player
+			player.Score += points
+		}
+	}
 }

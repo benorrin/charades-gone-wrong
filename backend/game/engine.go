@@ -5,6 +5,34 @@ import (
 	"time"
 )
 
+// Game constants
+const (
+	MaxPlayersPerGame = 16
+	MinRoundCount     = 10
+	MaxRoundCount     = 30
+	RoundIntroDelay   = 3 * time.Second
+	DefaultRoundCount = 20
+)
+
+// IsValidGameType checks if the game type is valid
+func IsValidGameType(gameType string) bool {
+	validTypes := []string{"normal", "spicy", "unhinged"}
+	for _, valid := range validTypes {
+		if gameType == valid {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeRoundCount ensures round count is within valid range
+func NormalizeRoundCount(roundCount int) int {
+	if roundCount < MinRoundCount || roundCount > MaxRoundCount {
+		return DefaultRoundCount
+	}
+	return roundCount
+}
+
 // NewGame creates a new game
 func NewGame(code string, hostID string, gameType GameType, roundCount int) *Game {
 	return &Game{
@@ -43,6 +71,18 @@ func (g *Game) SetPlayerName(playerID string, name string) error {
 	return ErrPlayerNotFound
 }
 
+// SetPlayerNameIfUnique sets a player's name only if it's not already taken by another player
+func (g *Game) SetPlayerNameIfUnique(playerID string, name string) error {
+	// Check if name is already taken by another player
+	for id, player := range g.Players {
+		if id != playerID && player.Name == name {
+			return ErrDuplicatePlayerName
+		}
+	}
+	// Name is unique, proceed with setting it
+	return g.SetPlayerName(playerID, name)
+}
+
 // CanStart checks if the game can be started (host + at least 2 players)
 func (g *Game) CanStart() bool {
 	if g.Status != GameStatusLobby || len(g.Players) < 2 {
@@ -63,54 +103,95 @@ func (g *Game) Start() error {
 
 // StartNextRound starts the next round and returns the round details
 func (g *Game) StartNextRound() (*Round, error) {
+	if err := g.validateRoundStart(); err != nil {
+		return nil, err
+	}
+
+	roundType := g.GetNextRoundType()
+	round := g.createRound(roundType)
+
+	if err := g.setupRoundByType(round); err != nil {
+		return nil, err
+	}
+
+	g.Rounds = append(g.Rounds, round)
+	return round, nil
+}
+
+// validateRoundStart checks if a round can be started
+func (g *Game) validateRoundStart() error {
 	if g.Status != GameStatusInProgress {
-		return nil, ErrInvalidGameStatus
+		return ErrInvalidGameStatus
 	}
 
 	if g.CurrentRound >= g.RoundCount {
 		g.Status = GameStatusFinished
-		return nil, ErrGameFinished
+		return ErrGameFinished
 	}
 
-	roundType := g.GetNextRoundType()
+	return nil
+}
 
-	round := &Round{
+// createRound creates a new round with basic info
+func (g *Game) createRound(roundType RoundType) *Round {
+	return &Round{
 		ID:        GenerateID(),
 		GameID:    g.ID,
 		RoundNum:  g.CurrentRound,
 		RoundType: roundType,
 		StartTime: time.Now(),
 	}
+}
 
-	// Set duration and content based on round type
-	switch roundType {
+// setupRoundByType configures round-specific properties based on type
+func (g *Game) setupRoundByType(round *Round) error {
+	switch round.RoundType {
 	case RoundTypePubQuiz:
-		round.Duration = 10 * time.Second
-		// Prompt would be the question text
-		round.Prompt = "Next question loading..."
+		g.setupPubQuizRound(round)
 	case RoundTypeCharades:
-		round.Duration = 30 * time.Second
-		actor := g.GetRandomPlayer()
-		if actor == nil {
-			return nil, ErrPlayerNotFound
-		}
-		round.ActorID = actor.ID
-		round.Prompt = "Act out the prompt!"
+		return g.setupCharadesRound(round)
 	case RoundTypeAlibi:
-		round.Duration = 60 * time.Second
-		suspect := g.GetRandomPlayer()
-		if suspect == nil {
-			return nil, ErrPlayerNotFound
-		}
-		round.ActorID = suspect.ID
-		round.CrimeText = "The crime is..." // placeholder
+		return g.setupAlibiRound(round)
 	case RoundTypeCopycat:
-		round.Duration = 10 * time.Second
-		round.Prompt = "Write your answer..."
+		g.setupCopycatRound(round)
 	}
+	return nil
+}
 
-	g.Rounds = append(g.Rounds, round)
-	return round, nil
+// setupPubQuizRound configures a pub quiz round
+func (g *Game) setupPubQuizRound(round *Round) {
+	round.Duration = 10 * time.Second
+	round.Prompt = "Next question loading..."
+}
+
+// setupCharadesRound configures a charades round
+func (g *Game) setupCharadesRound(round *Round) error {
+	round.Duration = 30 * time.Second
+	actor := g.GetRandomPlayer()
+	if actor == nil {
+		return ErrPlayerNotFound
+	}
+	round.ActorID = actor.ID
+	round.Prompt = "Act out the prompt!"
+	return nil
+}
+
+// setupAlibiRound configures an alibi round
+func (g *Game) setupAlibiRound(round *Round) error {
+	round.Duration = 60 * time.Second
+	suspect := g.GetRandomPlayer()
+	if suspect == nil {
+		return ErrPlayerNotFound
+	}
+	round.ActorID = suspect.ID
+	round.CrimeText = "The crime is..."
+	return nil
+}
+
+// setupCopycatRound configures a copycat round
+func (g *Game) setupCopycatRound(round *Round) {
+	round.Duration = 10 * time.Second
+	round.Prompt = "Write your answer..."
 }
 
 // AdvanceRound moves to the next round
@@ -119,6 +200,17 @@ func (g *Game) AdvanceRound() {
 		g.CurrentRound++
 	} else {
 		g.Status = GameStatusFinished
+	}
+}
+
+// Reset resets the game state while keeping all players
+func (g *Game) Reset() {
+	g.Status = GameStatusInProgress
+	g.CurrentRound = 1
+
+	// Reset all player scores to 0
+	for _, player := range g.Players {
+		player.Score = 0
 	}
 }
 
@@ -175,11 +267,22 @@ func (g *Game) GetPlayerByID(playerID string) *Player {
 
 // GetLeaderboard returns sorted players by score (highest first)
 func (g *Game) GetLeaderboard() []*Player {
+	players := g.buildPlayerList()
+	g.sortPlayersByScore(players)
+	return players
+}
+
+// buildPlayerList converts players map to a slice
+func (g *Game) buildPlayerList() []*Player {
 	players := make([]*Player, 0, len(g.Players))
 	for _, p := range g.Players {
 		players = append(players, p)
 	}
+	return players
+}
 
+// sortPlayersByScore sorts players by score in descending order
+func (g *Game) sortPlayersByScore(players []*Player) {
 	// Simple bubble sort (for small player counts, this is fine)
 	for i := 0; i < len(players); i++ {
 		for j := i + 1; j < len(players); j++ {
@@ -188,21 +291,4 @@ func (g *Game) GetLeaderboard() []*Player {
 			}
 		}
 	}
-
-	return players
-}
-
-// GenerateID generates a unique ID
-func GenerateID() string {
-	return time.Now().Format("20060102150405") + "_" + randString(8)
-}
-
-// Helper function for random string
-func randString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
-	}
-	return string(b)
 }

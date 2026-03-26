@@ -2,41 +2,14 @@ package api
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
-	"game/db"
 	"game/game"
+	"game/logger"
 	"game/ws"
-
-	"github.com/gorilla/websocket"
 )
-
-// Server holds all dependencies for API handlers
-type Server struct {
-	DB       *db.Database
-	Games    map[string]*game.Game
-	Hubs     map[string]*ws.Hub
-	mutex    sync.RWMutex
-	upgrader websocket.Upgrader
-}
-
-// NewServer creates a new API server
-func NewServer(database *db.Database) *Server {
-	return &Server{
-		DB:    database,
-		Games: make(map[string]*game.Game),
-		Hubs:  make(map[string]*ws.Hub),
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true // Allow all origins for development
-			},
-		},
-	}
-}
 
 // HandleCreateGame endpoint
 func (s *Server) HandleCreateGame(w http.ResponseWriter, r *http.Request) {
@@ -51,15 +24,25 @@ func (s *Server) HandleCreateGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.GameType != "normal" && req.GameType != "spicy" && req.GameType != "unhinged" {
+	if !game.IsValidGameType(req.GameType) {
 		http.Error(w, "Invalid game type", http.StatusBadRequest)
 		return
 	}
 
-	if req.RoundCount < 10 || req.RoundCount > 30 {
-		req.RoundCount = 20
-	}
+	req.RoundCount = game.NormalizeRoundCount(req.RoundCount)
 
+	g, code, hostID := s.createAndRegisterGame(req)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CreateGameResponse{
+		GameID: g.ID,
+		Code:   code,
+		HostID: hostID,
+	})
+}
+
+// createAndRegisterGame creates a new game and registers it in the server
+func (s *Server) createAndRegisterGame(req CreateGameRequest) (*game.Game, string, string) {
 	code := game.GenerateJoinCode()
 	hostID := game.GenerateID()
 
@@ -74,12 +57,7 @@ func (s *Server) HandleCreateGame(w http.ResponseWriter, r *http.Request) {
 	s.Hubs[g.ID] = hub
 	s.mutex.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(CreateGameResponse{
-		GameID: g.ID,
-		Code:   code,
-		HostID: hostID,
-	})
+	return g, code, hostID
 }
 
 // HandleJoinGame endpoint
@@ -95,16 +73,38 @@ func (s *Server) HandleJoinGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Code = strings.ToUpper(strings.TrimSpace(req.Code))
-	if !game.ValidateJoinCode(req.Code) {
-		http.Error(w, "Invalid code format", http.StatusBadRequest)
+	targetGame, ok := s.findAndValidateGame(req.Code, w)
+	if !ok {
 		return
+	}
+
+	playerID := s.addPlayerToGame(targetGame, w)
+	if playerID == "" {
+		return
+	}
+
+	s.broadcastPlayerJoined(targetGame, playerID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(JoinGameResponse{
+		GameID:   targetGame.ID,
+		PlayerID: playerID,
+		Players:  len(targetGame.Players),
+	})
+}
+
+// findAndValidateGame finds a game by code and validates it's accepting players
+func (s *Server) findAndValidateGame(code string, w http.ResponseWriter) (*game.Game, bool) {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if !game.ValidateJoinCode(code) {
+		http.Error(w, "Invalid code format", http.StatusBadRequest)
+		return nil, false
 	}
 
 	s.mutex.RLock()
 	var targetGame *game.Game
 	for _, g := range s.Games {
-		if g.Code == req.Code {
+		if g.Code == code {
 			targetGame = g
 			break
 		}
@@ -113,22 +113,31 @@ func (s *Server) HandleJoinGame(w http.ResponseWriter, r *http.Request) {
 
 	if targetGame == nil {
 		http.Error(w, "Game not found", http.StatusNotFound)
-		return
+		return nil, false
 	}
 
 	if targetGame.Status != game.GameStatusLobby {
 		http.Error(w, "Game not accepting new players", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 
-	if len(targetGame.Players) >= 16 {
+	return targetGame, true
+}
+
+// addPlayerToGame adds a new player to a game, returning the player ID
+func (s *Server) addPlayerToGame(targetGame *game.Game, w http.ResponseWriter) string {
+	if len(targetGame.Players) >= game.MaxPlayersPerGame {
 		http.Error(w, "Game is full", http.StatusBadRequest)
-		return
+		return ""
 	}
 
 	playerID := game.GenerateID()
 	targetGame.AddPlayer(playerID, false)
+	return playerID
+}
 
+// broadcastPlayerJoined broadcasts that a player joined
+func (s *Server) broadcastPlayerJoined(targetGame *game.Game, playerID string) {
 	s.mutex.RLock()
 	hub := s.Hubs[targetGame.ID]
 	s.mutex.RUnlock()
@@ -141,13 +150,6 @@ func (s *Server) HandleJoinGame(w http.ResponseWriter, r *http.Request) {
 		}
 		hub.BroadcastMessage(ws.MsgTypePlayerJoined, payload)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(JoinGameResponse{
-		GameID:   targetGame.ID,
-		PlayerID: playerID,
-		Players:  len(targetGame.Players),
-	})
 }
 
 // HandleSetPlayerName endpoint
@@ -177,21 +179,28 @@ func (s *Server) HandleSetPlayerName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mutex.RLock()
-	g, exists := s.Games[gameID]
-	s.mutex.RUnlock()
-
-	if !exists {
-		http.Error(w, "Game not found", http.StatusNotFound)
+	g, ok := s.getGame(gameID, w)
+	if !ok {
 		return
 	}
 
-	if err := g.SetPlayerName(playerID, req.Name); err != nil {
-		http.Error(w, "Player not found", http.StatusNotFound)
+	if err := g.SetPlayerNameIfUnique(playerID, req.Name); err != nil {
+		if err == game.ErrDuplicatePlayerName {
+			http.Error(w, "Player name already taken", http.StatusConflict)
+		} else {
+			http.Error(w, "Player not found", http.StatusNotFound)
+		}
 		return
 	}
 
-	// Broadcast updated player list to all connected clients
+	s.broadcastPlayerList(gameID, playerID, g)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// broadcastPlayerList broadcasts the updated player list
+func (s *Server) broadcastPlayerList(gameID, playerID string, g *game.Game) {
 	s.mutex.RLock()
 	hub := s.Hubs[gameID]
 	s.mutex.RUnlock()
@@ -204,9 +213,6 @@ func (s *Server) HandleSetPlayerName(w http.ResponseWriter, r *http.Request) {
 		}
 		hub.BroadcastMessage(ws.MsgTypePlayerJoined, payload)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // HandleStartGame endpoint
@@ -222,12 +228,8 @@ func (s *Server) HandleStartGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mutex.RLock()
-	g, exists := s.Games[req.GameID]
-	s.mutex.RUnlock()
-
-	if !exists {
-		http.Error(w, "Game not found", http.StatusNotFound)
+	g, ok := s.getGame(req.GameID, w)
+	if !ok {
 		return
 	}
 
@@ -237,7 +239,14 @@ func (s *Server) HandleStartGame(w http.ResponseWriter, r *http.Request) {
 	}
 
 	g.Start()
+	s.startGameRound(g)
 
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
+}
+
+// startGameRound broadcasts game start and begins the first round
+func (s *Server) startGameRound(g *game.Game) {
 	s.mutex.RLock()
 	hub := s.Hubs[g.ID]
 	s.mutex.RUnlock()
@@ -249,76 +258,90 @@ func (s *Server) HandleStartGame(w http.ResponseWriter, r *http.Request) {
 			TotalPlayers: len(g.Players),
 		}
 		hub.BroadcastMessage(ws.MsgTypeGameStarted, payload)
-
 		// Start first round
 		go s.startRound(g, hub)
 	}
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
+// getGame retrieves a game by ID from the server
+func (s *Server) getGame(gameID string, w http.ResponseWriter) (*game.Game, bool) {
+	s.mutex.RLock()
+	g, exists := s.Games[gameID]
+	s.mutex.RUnlock()
+
+	if !exists {
+		http.Error(w, "Game not found", http.StatusNotFound)
+		return nil, false
+	}
+	return g, true
 }
 
 // startRound is a helper that starts a round and broadcasts it
 func (s *Server) startRound(g *game.Game, hub *ws.Hub) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[startRound] PANIC: %v", r)
+			logger.Panic("startRound", "Panic in round handler", r)
 		}
 	}()
 
-	log.Printf("[startRound] Starting for game %s", g.ID)
+	logger.Debug("startRound", "Starting for game %s", g.ID)
 	// Wait a bit for clients to be ready
 	<-time.After(1 * time.Second)
 
 	round, err := g.StartNextRound()
 	if err != nil {
-		log.Printf("[startRound] Error: %v", err)
-		if err == game.ErrGameFinished {
-			// Game ended, broadcast leaderboard
-			leaderboard := g.GetLeaderboard()
-			rankings := make([]ws.LeaderboardEntry, len(leaderboard))
-			for i, p := range leaderboard {
-				rankings[i] = ws.LeaderboardEntry{
-					Rank:  i + 1,
-					Name:  p.Name,
-					Score: p.Score,
-				}
-			}
-			log.Printf("[startRound] Broadcasting leaderboard with %d entries", len(rankings))
-			hub.BroadcastMessage(ws.MsgTypeLeaderboard, ws.LeaderboardPayload{
-				Rankings: rankings,
-			})
-		}
+		s.handleRoundStartError(err, g, hub)
 		return
 	}
-	log.Printf("[startRound] Round %d started, type: %s", round.RoundNum, round.RoundType)
 
-	// Get player name for actor
-	actorName := ""
-	if round.ActorID != "" {
-		if actor := g.GetPlayerByID(round.ActorID); actor != nil {
-			actorName = actor.Name
-		}
+	logger.Debug("startRound", "Round %d started, type: %s", round.RoundNum, round.RoundType)
+
+	// Setup and broadcast round
+	s.setupAndBroadcastRound(round, g, hub)
+
+	// Wait for round to complete
+	s.waitForRoundCompletion(round)
+
+	// Calculate and broadcast results
+	s.calculateAndBroadcastRoundResults(g, round, hub)
+
+	// Advance and potentially start next round
+	g.AdvanceRound()
+	if g.Status == game.GameStatusInProgress {
+		s.startRound(g, hub)
 	}
+}
 
-	// Load question for pub quiz rounds
-	var question *ws.QuestionPayload
-	var correctAnswerIdx int
-	if round.RoundType == game.RoundTypePubQuiz {
-		q, err := s.DB.GetRandomPubQuizQuestion(string(g.GameType))
-		if err != nil {
-			log.Printf("Failed to load question: %v", err)
-		} else {
-			round.QuestionID = q.ID
-			correctAnswerIdx = q.CorrectAnswerID
-			question = &ws.QuestionPayload{
-				Text:    q.Text,
-				Answers: q.Answers,
+// handleRoundStartError handles errors when starting a round
+func (s *Server) handleRoundStartError(err error, g *game.Game, hub *ws.Hub) {
+	logger.Error("startRound", "Error: %v", err)
+	if err == game.ErrGameFinished {
+		// Game ended, broadcast leaderboard
+		leaderboard := g.GetLeaderboard()
+		rankings := make([]ws.LeaderboardEntry, len(leaderboard))
+		for i, p := range leaderboard {
+			rankings[i] = ws.LeaderboardEntry{
+				Rank:  i + 1,
+				Name:  p.Name,
+				Score: p.Score,
 			}
 		}
+		logger.Debug("startRound", "Broadcasting leaderboard with %d entries", len(rankings))
+		hub.BroadcastMessage(ws.MsgTypeLeaderboard, ws.LeaderboardPayload{
+			Rankings: rankings,
+		})
 	}
+}
 
-	// Broadcast round started
+// setupAndBroadcastRound loads question data and broadcasts round to players
+func (s *Server) setupAndBroadcastRound(round *game.Round, g *game.Game, hub *ws.Hub) {
+	// Get player name for actor
+	actorName := s.getActorName(round, g)
+
+	// Load question for pub quiz rounds and store correct answer in hub
+	question := s.loadQuestionIfNeeded(round, g, hub)
+
+	// Build and broadcast round payload
 	var questionPayload ws.QuestionPayload
 	if question != nil {
 		questionPayload = *question
@@ -334,50 +357,67 @@ func (s *Server) startRound(g *game.Game, hub *ws.Hub) {
 		Question:  questionPayload,
 	}
 
-	// Store the correct answer in the hub for pub_quiz rounds (for submission checking)
-	if round.RoundType == game.RoundTypePubQuiz && correctAnswerIdx >= 0 {
-		hub.SetRoundAnswer(round.RoundNum, correctAnswerIdx)
-		log.Printf("[startRound] Stored correct answer %d for round %d", correctAnswerIdx, round.RoundNum)
+	logger.Debug("startRound", "Broadcasting round started message")
+	hub.BroadcastMessage(ws.MsgTypeRoundStarted, roundPayload)
+}
+
+// getActorName retrieves the actor's name for the current round
+func (s *Server) getActorName(round *game.Round, g *game.Game) string {
+	if round.ActorID != "" {
+		if actor := g.GetPlayerByID(round.ActorID); actor != nil {
+			return actor.Name
+		}
+	}
+	return ""
+}
+
+// loadQuestionIfNeeded loads a question for pub quiz rounds
+func (s *Server) loadQuestionIfNeeded(round *game.Round, g *game.Game, hub *ws.Hub) *ws.QuestionPayload {
+	if round.RoundType != game.RoundTypePubQuiz {
+		return nil
 	}
 
-	log.Printf("[startRound] Broadcasting round started message")
-	hub.BroadcastMessage(ws.MsgTypeRoundStarted, roundPayload)
-	log.Printf("[startRound] Round message broadcast complete, waiting %d seconds or all players answered", int(round.Duration.Seconds()))
+	q, err := s.DB.GetRandomPubQuizQuestion(string(g.GameType))
+	if err != nil {
+		logger.Error("startRound", "Failed to load question: %v", err)
+		return nil
+	}
 
-	// Create a done channel to stop the goroutine when we're done waiting
-	doneChan := make(chan struct{})
+	round.QuestionID = q.ID
+	correctAnswerIdx := q.CorrectAnswerID
 
-	// Start a goroutine to check for all players answering
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[startRound] PANIC in answer check goroutine for round %d: %v", round.RoundNum, r)
-			}
-		}()
+	logger.Debug("startRound", "Loaded question %s (type: %s), correct answer index: %d", q.ID, g.GameType, correctAnswerIdx)
 
-		// Just wait for the done signal and exit
-		<-doneChan
-		log.Printf("[startRound] Answer check goroutine stopping for round %d", round.RoundNum)
-	}()
+	// Store the correct answer in hub for WebSocket validation of submissions
+	if correctAnswerIdx >= 0 {
+		hub.SetRoundAnswer(round.RoundNum, correctAnswerIdx)
+		logger.Debug("startRound", "Stored correct answer %d for round %d in hub", correctAnswerIdx, round.RoundNum)
+	} else {
+		logger.Error("startRound", "Invalid correct answer index %d for question %s", correctAnswerIdx, q.ID)
+	}
 
-	// Wait for intro screen duration (3 seconds) - frontend shows round info during this time
-	introDelay := 3 * time.Second
-	log.Printf("[startRound] Round %d: waiting %d seconds for intro screen", round.RoundNum, int(introDelay.Seconds()))
-	<-time.After(introDelay)
+	return &ws.QuestionPayload{
+		Text:    q.Text,
+		Answers: q.Answers,
+	}
+}
 
-	// Wait for round duration (10 seconds for pub_quiz)
-	log.Printf("[startRound] Round %d: intro complete, waiting %d seconds for question answers", round.RoundNum, int(round.Duration.Seconds()))
+// waitForRoundCompletion waits for the round duration with intro delay
+func (s *Server) waitForRoundCompletion(round *game.Round) {
+	// Wait for intro screen duration - frontend shows round info during this time
+	logger.Debug("startRound", "Round %d: waiting %d seconds for intro screen", round.RoundNum, int(game.RoundIntroDelay.Seconds()))
+	<-time.After(game.RoundIntroDelay)
+
+	// Wait for round duration
+	logger.Debug("startRound", "Round %d: intro complete, waiting %d seconds for answers", round.RoundNum, int(round.Duration.Seconds()))
 	<-time.After(round.Duration)
-	log.Printf("[startRound] Round %d: duration expired", round.RoundNum)
+	logger.Debug("startRound", "Round %d: duration expired", round.RoundNum)
+}
 
-	// Signal the answer check goroutine to stop
-	log.Printf("[startRound] Round %d: closing doneChan to stop answer check goroutine", round.RoundNum)
-	close(doneChan)
-
-	// Calculate scores
-	log.Printf("[startRound] About to calculate scores for round %d", round.RoundNum)
+// calculateAndBroadcastRoundResults scores the round and broadcasts results
+func (s *Server) calculateAndBroadcastRoundResults(g *game.Game, round *game.Round, hub *ws.Hub) {
+	logger.Debug("startRound", "Calculating scores for round %d", round.RoundNum)
 	s.calculateRoundScores(g, round, hub)
-	log.Printf("[startRound] Scores calculated, about to broadcast round ended")
 
 	// End round
 	hub.BroadcastMessage(ws.MsgTypeRoundEnded, ws.RoundEndedPayload{
@@ -385,19 +425,10 @@ func (s *Server) startRound(g *game.Game, hub *ws.Hub) {
 		RoundType: string(round.RoundType),
 		Results:   ws.RoundResults{},
 	})
-	log.Printf("[startRound] Round ended broadcasted, about to broadcast scores")
+	logger.Debug("startRound", "Round ended broadcasted")
 
 	// Broadcast updated scores
 	s.broadcastScores(g, hub)
-	log.Printf("[startRound] Scores broadcasted, about to advance round")
-
-	// Advance and start next round
-	g.AdvanceRound()
-	log.Printf("[startRound] Advanced to round %d, game status: %v", g.CurrentRound, g.Status)
-	if g.Status == game.GameStatusInProgress {
-		log.Printf("[startRound] Starting next round recursively")
-		s.startRound(g, hub)
-	}
 }
 
 // HandleResetGame endpoint - resets the game while keeping all players
@@ -422,6 +453,22 @@ func (s *Server) HandleResetGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	g, hub, ok := s.getGameAndHub(gameID, w)
+	if !ok {
+		return
+	}
+
+	g.Reset()
+	logger.Info("HandleResetGame", "Game %s reset - %d players kept", g.ID, len(g.Players))
+	s.broadcastGameReset(g, hub)
+	s.startGameRound(g)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// getGameAndHub retrieves both the game and its hub
+func (s *Server) getGameAndHub(gameID string, w http.ResponseWriter) (*game.Game, *ws.Hub, bool) {
 	s.mutex.RLock()
 	g, gameExists := s.Games[gameID]
 	hub, hubExists := s.Hubs[gameID]
@@ -429,35 +476,18 @@ func (s *Server) HandleResetGame(w http.ResponseWriter, r *http.Request) {
 
 	if !gameExists || !hubExists {
 		http.Error(w, "Game not found", http.StatusNotFound)
-		return
+		return nil, nil, false
 	}
+	return g, hub, true
+}
 
-	// Reset game state but keep all players
-	g.Status = game.GameStatusInProgress
-	g.CurrentRound = 1
-
-	// Reset all player scores to 0
-	for _, player := range g.Players {
-		player.Score = 0
-	}
-
-	log.Printf("[HandleResetGame] Game %s reset - %d players kept", gameID, len(g.Players))
-
-	// Broadcast game started message to all connected clients
+// broadcastGameReset broadcasts game reset to all players
+func (s *Server) broadcastGameReset(g *game.Game, hub *ws.Hub) {
 	hub.BroadcastMessage(ws.MsgTypeGameStarted, ws.GameStartedPayload{
 		RoundCount:   g.RoundCount,
 		GameType:     string(g.GameType),
 		TotalPlayers: len(g.Players),
 	})
-
-	// Start first round after a short delay
-	go func() {
-		time.Sleep(1 * time.Second)
-		s.startRound(g, hub)
-	}()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // HandleGetGame endpoint
@@ -537,7 +567,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Upgrade HTTP connection to WebSocket
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
+		logger.ErrorWithErr("HandleWebSocket", "WebSocket upgrade error", err)
 		return
 	}
 
@@ -570,75 +600,60 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 func (s *Server) calculateRoundScores(g *game.Game, round *game.Round, hub *ws.Hub) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[calculateRoundScores PANIC] Round %d: %v", round.RoundNum, r)
+			logger.Panic("calculateRoundScores", "Panic in scoring", r)
 		}
 	}()
 
-	log.Printf("[calculateRoundScores] Getting submissions for round %d", round.RoundNum)
+	logger.Debug("calculateRoundScores", "Getting submissions for round %d", round.RoundNum)
 	submissions := hub.GetRoundSubmissions(round.RoundNum)
-	log.Printf("[calculateRoundScores] Got %d submissions", len(submissions))
+	logger.Debug("calculateRoundScores", "Got %d submissions", len(submissions))
 
 	switch round.RoundType {
 	case game.RoundTypePubQuiz:
-		log.Printf("[calculateRoundScores] Processing pub quiz with question ID: %s", round.QuestionID)
-		if round.QuestionID == "" {
-			log.Println("[calculateRoundScores] No question ID for pub quiz round")
-			return
-		}
+		s.calculatePubQuizScores(g, round, submissions)
+	}
+}
 
-		log.Printf("[calculateRoundScores] Querying database for question %s", round.QuestionID)
-		q, err := s.DB.GetPubQuizQuestionByID(round.QuestionID)
-		if err != nil {
-			log.Printf("[calculateRoundScores] Failed to get question: %v", err)
-			return
-		}
-		log.Printf("[calculateRoundScores] Got question: %s, correct answer: %d", q.Text, q.CorrectAnswerID)
+// calculatePubQuizScores scores pub quiz round answers with time-based multiplier
+func (s *Server) calculatePubQuizScores(g *game.Game, round *game.Round, submissions map[string]*ws.PlayerSubmissionPayload) {
+	logger.Debug("calculateRoundScores", "Processing pub quiz with question ID: %s", round.QuestionID)
+	if round.QuestionID == "" {
+		logger.Error("calculateRoundScores", "No question ID for pub quiz round")
+		return
+	}
 
-		// Score pub quiz answers with time-based multiplier
-		for playerID, submission := range submissions {
-			if player, exists := g.Players[playerID]; exists {
-				// Calculate score using the scoring function
-				points := game.PubQuizScoreWithTimestamp(
-					submission.AnswerIdx == q.CorrectAnswerID,
-					round.StartTime,
-					submission.SubmissionTime,
-					round.Duration,
-				)
+	logger.Debug("calculateRoundScores", "Querying database for question %s", round.QuestionID)
+	q, err := s.DB.GetPubQuizQuestionByID(round.QuestionID)
+	if err != nil {
+		logger.ErrorWithErr("calculateRoundScores", "Failed to get question", err)
+		return
+	}
+	logger.Debug("calculateRoundScores", "Got question: %s, correct answer: %d", q.Text, q.CorrectAnswerID)
 
-				if submission.AnswerIdx == q.CorrectAnswerID {
-					// Log correct answers with timing details
-					roundStartMs := round.StartTime.UnixMilli()
-					timeElapsedMs := submission.SubmissionTime - roundStartMs
-					roundDurationMs := round.Duration.Milliseconds()
-					timeRemainingMs := roundDurationMs - timeElapsedMs
-					if timeRemainingMs < 0 {
-						timeRemainingMs = 0
-					}
-					timeMultiplier := float64(timeRemainingMs) / float64(roundDurationMs)
+	// Score all pub quiz submissions using centralized scoring logic
+	game.ScorePubQuizRound(g, round, submissions, q)
 
-					log.Printf("[calculateRoundScores] Player %s: CORRECT, time: %dms / %dms, multiplier: %.2f, points: %d",
-						player.Name, timeElapsedMs, roundDurationMs, timeMultiplier, points)
-				} else {
-					log.Printf("[calculateRoundScores] Player %s: INCORRECT (chose %d, correct %d), 0 points",
-						player.Name, submission.AnswerIdx, q.CorrectAnswerID)
-				}
-
-				player.Score += points
+	// Log scoring summary
+	for playerID, submission := range submissions {
+		if player, exists := g.Players[playerID]; exists {
+			isCorrect := game.ValidatePubQuizAnswer(submission.AnswerIdx, q.CorrectAnswerID)
+			if isCorrect {
+				logger.Debug("calculateRoundScores", "Player %s answered correctly, score: %d", player.Name, player.Score)
 			}
 		}
-		log.Printf("[calculateRoundScores] Pub quiz scoring complete")
 	}
+	logger.Debug("calculateRoundScores", "Pub quiz scoring complete")
 }
 
 // broadcastScores broadcasts the current scores to all players
 func (s *Server) broadcastScores(g *game.Game, hub *ws.Hub) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[broadcastScores PANIC]: %v", r)
+			logger.Panic("broadcastScores", "Panic in broadcast", r)
 		}
 	}()
 
-	log.Printf("[broadcastScores] Building scores for %d players", len(g.Players))
+	logger.Debug("broadcastScores", "Building scores for %d players", len(g.Players))
 	scores := make([]ws.PlayerScore, 0, len(g.Players))
 	for _, player := range g.Players {
 		scores = append(scores, ws.PlayerScore{
@@ -648,9 +663,9 @@ func (s *Server) broadcastScores(g *game.Game, hub *ws.Hub) {
 		})
 	}
 
-	log.Printf("[broadcastScores] Broadcasting %d scores", len(scores))
+	logger.Debug("broadcastScores", "Broadcasting %d scores", len(scores))
 	hub.BroadcastMessage(ws.MsgTypeScoresUpdated, ws.ScoresUpdatedPayload{
 		Scores: scores,
 	})
-	log.Printf("[broadcastScores] Scores broadcast complete")
+	logger.Debug("broadcastScores", "Scores broadcast complete")
 }

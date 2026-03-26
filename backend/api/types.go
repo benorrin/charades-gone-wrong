@@ -1,5 +1,16 @@
 package api
 
+import (
+	"net/http"
+	"sync"
+
+	"game/db"
+	"game/game"
+	"game/ws"
+
+	"github.com/gorilla/websocket"
+)
+
 // CreateGameRequest is sent when creating a new game
 type CreateGameRequest struct {
 	GameType   string `json:"game_type"`
@@ -38,4 +49,27 @@ type StartGameRequest struct {
 // StatusResponse is a generic success response
 type StatusResponse struct {
 	Status string `json:"status"`
+}
+
+// Server holds all dependencies for API handlers
+type Server struct {
+	DB       *db.Database
+	Games    map[string]*game.Game
+	Hubs     map[string]*ws.Hub
+	mutex    sync.RWMutex
+	upgrader websocket.Upgrader
+}
+
+// NewServer creates a new API server
+func NewServer(database *db.Database) *Server {
+	return &Server{
+		DB:    database,
+		Games: make(map[string]*game.Game),
+		Hubs:  make(map[string]*ws.Hub),
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool {
+				return true // Allow all origins for development
+			},
+		},
+	}
 }

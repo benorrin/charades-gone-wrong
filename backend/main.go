@@ -2,22 +2,22 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 
 	"game/api"
 	"game/db"
+	"game/logger"
 )
 
 func main() {
 	// Initialize database
 	database, err := db.New("game.db")
 	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		logger.Panic("Main", "Failed to initialize database: %v", err)
 	}
 	defer database.Close()
 
-	log.Println("Database initialized successfully")
+	logger.Info("Main", "Database initialized successfully")
 
 	// Create API server
 	server := api.NewServer(database)
@@ -36,8 +36,8 @@ func main() {
 
 	// Start server
 	port := ":8080"
-	log.Printf("Starting server on %s", port)
+	logger.Info("Main", "Starting server on %s", port)
 	if err := http.ListenAndServe(port, mux); err != nil {
-		log.Fatalf("Server error: %v", err)
+		logger.Panic("Main", "Server error: %v", err)
 	}
 }
