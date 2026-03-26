@@ -184,8 +184,12 @@ func (s *Server) HandleSetPlayerName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := g.SetPlayerName(playerID, req.Name); err != nil {
-		http.Error(w, "Player not found", http.StatusNotFound)
+	if err := g.SetPlayerNameIfUnique(playerID, req.Name); err != nil {
+		if err == game.ErrDuplicatePlayerName {
+			http.Error(w, "Player name already taken", http.StatusConflict)
+		} else {
+			http.Error(w, "Player not found", http.StatusNotFound)
+		}
 		return
 	}
 

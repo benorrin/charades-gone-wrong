@@ -71,6 +71,18 @@ func (g *Game) SetPlayerName(playerID string, name string) error {
 	return ErrPlayerNotFound
 }
 
+// SetPlayerNameIfUnique sets a player's name only if it's not already taken by another player
+func (g *Game) SetPlayerNameIfUnique(playerID string, name string) error {
+	// Check if name is already taken by another player
+	for id, player := range g.Players {
+		if id != playerID && player.Name == name {
+			return ErrDuplicatePlayerName
+		}
+	}
+	// Name is unique, proceed with setting it
+	return g.SetPlayerName(playerID, name)
+}
+
 // CanStart checks if the game can be started (host + at least 2 players)
 func (g *Game) CanStart() bool {
 	if g.Status != GameStatusLobby || len(g.Players) < 2 {
