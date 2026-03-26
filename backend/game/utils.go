@@ -2,10 +2,7 @@ package game
 
 import (
 	"math/rand"
-<<<<<<< HEAD
 	"time"
-=======
->>>>>>> origin/main
 	"unicode"
 )
 
